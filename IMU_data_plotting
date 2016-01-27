@@ -1,0 +1,562 @@
+#!/usr/bin/env python
+
+#Basic imports
+import threading#allows multiple threads to run
+from ctypes import *#uses c language wrapper to speed up
+import time
+import sys
+import math
+import scipy
+import numpy as np
+#from scipy import interpolate
+#from scipy import integrate
+import scipy.integrate as si
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+#Libraries for GUI
+import Tkinter as Tk
+
+#Phidget specific imports
+from Phidgets.Phidget import Phidget
+from Phidgets.PhidgetException import PhidgetErrorCodes, PhidgetException
+from Phidgets.Events.Events import SpatialDataEventArgs, AttachEventArgs, DetachEventArgs, ErrorEventArgs
+from Phidgets.Devices.Spatial import Spatial, SpatialEventData, TimeSpan
+from Phidgets.Phidget import PhidgetLogLevel
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib
+from matplotlib.figure import Figure
+#from matplotlib import pyplot as plt
+matplotlib.use('TkAgg')
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
+# implement the default mpl key bindings
+from matplotlib.backend_bases import key_press_handler
+
+#Flags that control which program to launch
+control_flag=0#controls if user has chosen mode already
+press=''#contains mode choice, L(line) or M(3D plot)
+
+G = 9.80665 #meters per second squared
+
+#Some variables for accelerometer:
+ACCELEROMETER_SENSITIVITY =8192.0
+GYROSCOPE_SENSITIVITY= 30.536
+xa_1=0
+x_u=0#initial velocity X
+sum_x_a=0
+average_x_a=0
+x_s=0#current displacement X
+xs_1=0#previous displacement X
+#########################################
+ya_1=0
+y_u=0#initial velocity Y
+sum_y_a=0
+average_y_a=0
+y_s=0#current displacement Y
+ys_1=0#previous displacement Y
+#########################################
+za_1=0
+z_u=0#initial velocity Z
+sum_z_a=0
+average_z_a=0
+z_s=0#current displacement Z
+zs_1=0#previous displacement Z
+#########################################
+t_old=0#keeps time of the last measurment
+t_elapsed=0
+t_seconds=0
+t2=0
+i=0
+counter_acc=0
+########################################
+#Values of filtered pitch and roll
+pitch=0
+roll=0
+pitchAcc=0
+rollAcc=0
+#Gyro values
+deg_x_r=deg_z_r=deg_y_r=0
+sum_x_r=sum_y_r=sum_z_r=average_x_r=average_y_r=average_z_r=0
+m_roll=m_pitch=sum_roll=sum_pitch=average_roll=average_pitch=0
+#Compensated values:
+comp_roll=comp_pitch=0
+
+#Setting up the environment
+plt.ion()# interactive plot mode
+#fig = plt.figure()
+#ax = fig.gca(projection='3d')
+
+clr_counter=0#clears the plot after 30 measurments
+
+#fig = plt.figure()
+#plt.plot([1,2,3])
+#plt.subplot(211)
+#plt.plot(range(12))
+#plt.subplot(212, axisbg='y') # creates 2nd subplot with yellow background
+
+#Create GUI window
+root = Tk.Tk()
+root.wm_title("Sensor control panel") #Makes the title that will appear in the top left
+
+f = Figure(figsize=(6,5), dpi=100)
+a = f.add_subplot(111)
+
+
+# a tk.DrawingArea
+canvas = FigureCanvasTkAgg(f, master=root)
+canvas.show()
+canvas.get_tk_widget().pack(side=Tk.TOP, fill=Tk.BOTH, expand=1)
+
+toolbar = NavigationToolbar2TkAgg( canvas, root )
+toolbar.update()
+canvas._tkcanvas.pack(side=Tk.TOP, fill=Tk.BOTH, expand=1)
+
+#Handles key presses on the toolbar
+def on_key_event(event):
+    print('you pressed %s'%event.key)
+    key_press_handler(event, canvas, toolbar)
+
+canvas.mpl_connect('key_press_event', on_key_event)
+
+#Assignes name "spatial" for the sensor if there is an error it throws an exeption
+try:
+    spatial = Spatial()
+except RuntimeError as e:
+    print("Runtime Exception: %s" % e.details)
+    print("Exiting....")
+    exit(1)
+
+#Information Display Function
+def DisplayDeviceInfo():
+    print("|------------|----------------------------------|--------------|------------|")
+    print("|- Attached -|-              Type              -|- Serial No. -|-  Version -|")
+    print("|------------|----------------------------------|--------------|------------|")
+    print("|- %8s -|- %30s -|- %10d -|- %8d -|" % (spatial.isAttached(), spatial.getDeviceName(), spatial.getSerialNum(), spatial.getDeviceVersion()))
+    print("|------------|----------------------------------|--------------|------------|")
+    print("Number of Acceleration Axes: %i" % (spatial.getAccelerationAxisCount()))
+    print("Number of Gyro Axes: %i" % (spatial.getGyroAxisCount()))
+    print("Number of Compass Axes: %i" % (spatial.getCompassAxisCount()))
+
+#Event Handler Callback Functions
+def SpatialAttached(e):
+    attached = e.device
+    print("Spatial %i Attached!" % (attached.getSerialNum()))
+
+def SpatialDetached(e):
+    detached = e.device
+    print("Spatial %i Detached!" % (detached.getSerialNum()))
+
+def SpatialError(e):
+    try:
+        source = e.device
+        print("Spatial %i: Phidget Error %i: %s" % (source.getSerialNum(), e.eCode, e.description))
+    except PhidgetException as e:
+        print("Phidget Exception %i: %s" % (e.code, e.details))
+
+
+#Function that should if current sensor position is close to the starting point
+def position_detection(x_s, y_s, z_s):
+    #Should detect starting position and guide towards it
+    k=5#closeness coefficient
+    if x_s<k and x_s>-k:
+        if y_s<k and y_s>-k:
+            if z_s<k and z_s>-k:
+                print ("Initial position reached")
+            else:
+                print ("Z axis out of range")
+        else:
+            if z_s<k and z_s>-k:
+                print ("Y axis out of range")
+    else:
+        if y_s<k and y_s>-k:
+            if z_s<k and z_s>-k:
+                print ("X axis out of range")
+            else:
+                print ("LOST")
+        else:
+            print ("X and Y axis out of range")
+
+
+#Displays displacement data from sensor in 3D view
+def SpatialData3D(e):
+    a = f.gca(projection='3d')#Sets windows to show 3D graph
+    global t_old,t_seconds,t2#time
+    global xa_1,ya_1,za_1#acceleration
+    global x_u,y_u,z_u#velocities
+    global xs_1,ys_1,zs_1#disp
+    global G#gravity
+    global counter_acc#running averaging counter
+    global i
+    global sum_x_a,sum_y_a,sum_z_a,average_x_a,average_y_a,average_z_a#averaging values
+    global deg_x_r,deg_y_r,deg_z_r,sum_x_r,sum_y_r,sum_z_r,average_x_r,average_y_r,average_z_r,m_roll,m_pitch
+    global comp_roll,comp_pitch,sum_roll,sum_pitch,average_roll,average_pitch#compensated roll and pitch values
+    t=0#local variable time
+    S=''#string to store result of verbal compass direction calculation
+    t=t_elapsed=0
+    x_a=y_a=z_a=0
+    x_v=y_v=z_v=0
+    x_s=y_s=z_s=0
+    
+    source = e.device#get data from sensor and record it to "source" list
+    #iterate through list and save sensor readings to variables
+    for index, spatialData in enumerate(e.spatialData):
+        if len(spatialData.Acceleration) > 0:
+            x_a=spatialData.Acceleration[0]
+            y_a=spatialData.Acceleration[1]
+            z_a=spatialData.Acceleration[2]
+            
+            
+            x_a=float(x_a)*G#transform into m/s
+            y_a=float(y_a)*G#transform into m/s
+            z_a=(float(z_a)*G)#transform into m/s
+    
+        if len(spatialData.AngularRate) > 0:
+            x_r=spatialData.AngularRate[0]
+            y_r=spatialData.AngularRate[1]
+            z_r=spatialData.AngularRate[2]
+            
+        if len(spatialData.MagneticField) > 0:
+            x_m=spatialData.MagneticField[0]
+            y_m=spatialData.MagneticField[1]
+            z_m=spatialData.MagneticField[2]
+            
+            #Calculate compass direction and show as the value and
+            #general direction on the graph
+            heading = 180 * math.atan2(y_m,x_m)/math.pi
+            if heading < 0:
+                heading += 360
+                
+            if heading>337.5 or heading<22.5:
+                S= 'Heading:{} N'.format(heading)
+            elif heading>22.5 and heading<67.5:
+                S= 'Heading:{} NE'.format(heading)
+            elif heading>67.5 and heading<112.5:
+                S= 'Heading:{} E'.format(heading)
+            elif heading>112.5 and heading<157.5:
+                S= 'Heading:{} SE'.format(heading)
+            elif heading>157.5 and heading<202.5:
+                S= 'Heading:{} S'.format(heading)
+            elif heading>202.5 and heading<247.5:
+                S= 'Heading:{} SW'.format(heading)
+            elif heading>247.5 and heading<292.5:
+                S= 'Heading:{} W'.format(heading)
+            elif heading>292.5 and heading<337.5:
+                S= 'Heading:{} NW'.format(heading)
+            a.set_title(S, va='top')
+
+            m_roll = (180*math.atan2(y_m, z_m)/math.pi)+heading
+            m_pitch = ((180*math.atan(-x_m / ((y_m * math.sin(roll)) + (z_m * math.cos(roll))))/math.pi))+heading
+            #print("Angular Rate> x: %6f  y: %6f  z: %6f" % (spatialData.AngularRate[0], spatialData.AngularRate[1], spatialData.AngularRate[2]))
+
+        t=spatialData.Timestamp.microSeconds
+        t_elapsed=spatialData.Timestamp.seconds
+
+        #Initial averaging algorithm
+        if i<=99:
+            i=i+1
+            sum_roll=sum_roll+m_roll
+            sum_pitch=sum_pitch+m_pitch
+            
+            sum_x_r=sum_x_r+x_r
+            sum_y_r=sum_y_r+y_r
+            sum_z_r=sum_z_r+z_r
+            
+            sum_x_a=sum_x_a+x_a
+            sum_y_a=sum_y_a+y_a
+            sum_z_a=sum_z_a+z_a
+        elif i==100:
+            i=i+1
+            average_roll=sum_roll/100
+            average_pitch=sum_pitch/100
+            
+            average_x_r=sum_x_r/100
+            average_y_r=sum_y_r/100
+            average_z_r=sum_z_r/100
+            
+            average_x_a=sum_x_a/100
+            average_y_a=sum_y_a/100
+            average_z_a=sum_z_a/100
+        elif i>100:
+            m_roll=m_roll-average_roll
+            m_pitch=m_pitch-average_pitch
+            
+            x_r=x_r-average_x_r
+            y_r=y_r-average_y_r
+            z_r=z_r-average_z_r
+            
+            x_a=x_a-average_x_a
+            y_a=y_a-average_y_a
+            z_a=z_a-average_z_a
+
+            sum_x_r=sum_y_r=sum_z_r=0
+            #running averaging
+            if counter_acc<=2:
+                counter_acc=counter_acc+1
+                sum_x_r=sum_x_r+x_a
+                sum_y_r=sum_y_r+y_a
+                sum_z_r=sum_z_r+z_a
+            elif counter_acc==3:
+                counter_acc=counter_acc+1
+                x_a=sum_x_r/3
+                y_a=sum_y_r/3
+                z_a=sum_z_r/3
+            else:
+                counter_acc=0
+                
+            t=float(t/1000000.0)#convert to seconds
+            t1=t_elapsed+t
+            dt=t1-t2#time between two measurments
+            t2=t_elapsed+t
+            
+            deg_x_r=deg_x_r+x_r*dt#convert d/s to degrees for x
+            deg_y_r=deg_y_r+y_r*dt#convert d/s to degrees for y
+            deg_z_r=deg_z_r+z_r*dt#convert d/s to degrees for z
+
+            #print (m_pitch,m_roll)
+        
+##            comp_roll = 0.80*(comp_roll + x_r*dt) +0.20*m_roll
+##            comp_pitch = 0.80*(comp_pitch - y_r*dt) +0.20*m_pitch
+            print (deg_x_r,deg_y_r,deg_z_r)
+            
+##            x_a=x_a-comp_pitch*0.109
+##            y_a=y_a-comp_roll*0.109
+##            z_a=z_a-(comp_roll*0.109+comp_pitch*0.109)
+
+            x_v=(xa_1+x_a)*(dt/2)#x_u has been deleted to improve perfomance 
+            y_v=(ya_1+y_a)*(dt/2)
+            z_v=(za_1+z_a)*(dt/2)
+            #print x_a,y_a,z_a,t_elapsed
+            #formula for displacement
+            x_s=xs_1+(x_u+x_v)*(dt/2)
+            y_s=ys_1+(y_u+y_v)*(dt/2)
+            z_s=zs_1+(z_u+z_v)*(dt/2)
+
+            #Debugging info to print
+            ##    print ("acceleration=",x_a,y_a,z_a)
+            ##    print ("velocity=",x_v,y_v,z_v)
+            ##    print ("displacement=",x_s,y_s,z_s)
+            ##    print ("time=",t_actual)
+            a.plot([xs_1,x_s],[ys_1,y_s],[zs_1,z_s],  color='r', linestyle='-', linewidth=2)#draw sensor trajectory in 3D
+            f.canvas.draw()#constantly update plot
+            position_detection(x_s,y_s,z_s)
+            #position_detection(x_s, y_s, z_s)#detect if we reached starting positi
+
+            #New acceleration to previous acceleration
+            xa_1=x_a
+            ya_1=y_a
+            za_1=z_a
+            
+            #New velocity to previous velocity
+            x_u=x_v
+            y_u=y_v
+            z_u=z_v
+            
+            #New displacement to previous displacement
+            xs_1=x_s
+            zs_1=z_s
+            ys_1=y_s
+
+    
+def SpatialDataLine(e):
+    global t_old,t_seconds,t2#time
+    global xa_1,ya_1#acceleration
+    global x_u,y_u#velocities
+    global xs_1,ys_1#disp
+    global G#gravity
+    global counter_acc#running averaging counter
+    global i
+    global sum_x_a,sum_y_a,sum_z_a,average_x_a,average_y_a,average_z_a#averaging values
+    t=0#local variable time
+    t=t_elapsed=0
+    x_a=y_a=0
+    x_v=y_v=0
+    x_s=y_s=0
+    
+    source = e.device#get data from sensor and record it to "source" list
+    #iterate through list and save sensor readings to variables
+    for index, spatialData in enumerate(e.spatialData):
+        if len(spatialData.Acceleration) > 0:
+            x_a=spatialData.Acceleration[0]
+            y_a=spatialData.Acceleration[1]
+            z_a=spatialData.Acceleration[2]
+            
+            x_a=float(x_a)*G#transform into m/s
+            y_a=float(y_a)*G#transform into m/s
+            z_a=(float(z_a)*G)#transform into m/s
+            #print "raw data"
+    
+        t=spatialData.Timestamp.microSeconds
+        t_elapsed=spatialData.Timestamp.seconds
+
+        #Initial averaging algorithm
+        if i<=99:
+            i=i+1
+        
+            sum_x_a=sum_x_a+x_a
+            sum_y_a=sum_y_a+y_a
+        elif i==100:
+            i=i+1
+            
+            average_x_a=sum_x_a/100
+            average_y_a=sum_y_a/100
+            average_z_a=sum_z_a/100
+        elif i>100:
+            x_a=x_a-average_x_a
+            y_a=y_a-average_y_a
+            z_a=z_a-average_z_a
+
+            #average the distance measurments
+            if counter_acc<=2:
+                counter_acc=counter_acc+1
+                sum_x_a=sum_x_a+x_a
+                sum_y_a=sum_y_a+y_a
+                sum_z_a=sum_z_a+z_a
+            elif counter_acc==3:
+                counter_acc=counter_acc+1
+                x_a=sum_x_a/3
+                y_a=sum_y_a/3
+                z_a=sum_z_a/3
+            else:
+                counter_acc=0
+                sum_x_a=sum_y_a=sum_z_a=0
+                
+            t=float(t/1000000.0)#convert to seconds
+            t1=t_elapsed+t
+            dt=t1-t2
+            t2=t_elapsed+t
+
+            x_v=(xa_1+x_a)*(dt/2)
+            y_v=(ya_1+y_a)*(dt/2)
+
+            #formula for displacement
+            x_s=xs_1+(x_u+x_v)*(dt/2)
+            y_s=ys_1+(y_u+y_v)*(dt/2)
+
+            a.plot([xs_1,x_s],[ys_1,y_s],  color='r', linestyle='-', linewidth=2)#draw sensor trajectory in 3D
+            f.canvas.draw()#constantly update plot
+            #position_detection(x_s, y_s, z_s)#detect if we reached starting positi
+
+            #New acceleration to previous acceleration
+            xa_1=x_a
+            ya_1=y_a
+            
+            #New velocity to previous velocity
+            x_u=x_v
+            y_u=y_v
+            
+            #New displacement to previous displacement
+            xs_1=x_s
+            ys_1=y_s
+
+
+#logging example, uncomment to generate a log file
+    #spatial.enableLogging(PhidgetLogLevel.PHIDGET_LOG_VERBOSE, "phidgetlog.log")
+try:
+    spatial.setOnAttachHandler(SpatialAttached)
+    spatial.setOnDetachHandler(SpatialDetached)
+    spatial.setOnErrorhandler(SpatialError)
+    #spatial.setOnSpatialDataHandler(SpatialData3D)
+except PhidgetException as e:
+    print("Phidget Exception %i: %s" % (e.code, e.details))
+    print("Exiting....")
+    exit(1)
+
+print("Opening phidget object....")
+
+try:
+    spatial.openPhidget()
+except PhidgetException as e:
+    print("Phidget Exception %i: %s" % (e.code, e.details))
+    print("Exiting....")
+    exit(1)
+
+print("Waiting for attach....")
+
+try:
+    spatial.waitForAttach(10000)
+except PhidgetException as e:
+    print("Phidget Exception %i: %s" % (e.code, e.details))
+    try:
+        spatial.closePhidget()
+    except PhidgetException as e:
+        print("Phidget Exception %i: %s" % (e.code, e.details))
+        print("Exiting....")
+        exit(1)
+    print("Exiting....")
+    exit(1)
+else:
+    spatial.setDataRate(40)#number of us between each reading
+    DisplayDeviceInfo()
+
+def check_choice_m():
+    global control_flag,press
+    spatial.openPhidget()
+    if control_flag==0:
+        control_flag=1
+        press='M'
+        print ("3D mode chosen")
+
+def check_choice_l():
+    global control_flag,press
+    spatial.openPhidget()
+    if control_flag==0:
+        control_flag=1
+        press='L'
+        print ("Line mode chosen")
+            
+def check_choice_off():
+    global control_flag,press,xs_1,ys_1,zs_1,x_u,y_u,z_u,xa_1,ya_1,za_1
+    if control_flag==1:
+        control_flag=0
+        print ("Paused")
+        press=''
+        spatial.closePhidget()#disconnect the sensor
+        
+        
+def _quit():
+    spatial.closePhidget()#disconnect the sensor
+    root.quit()     # stops mainloop
+    root.destroy()  # this is necessary on Windows to prevent
+                    # Fatal Python Error: PyEval_RestoreThread: NULL tstate
+    exit(1)
+    
+triaxe_b = Tk.Button(master=root, text ="3D mode", command = check_choice_m)#3D mode button
+triaxe_b.pack( side = Tk.LEFT)
+
+line_b = Tk.Button(master=root, text ="Line mode", command = check_choice_l)#2D mode button
+line_b.pack( side = Tk.LEFT)
+
+stop_b = Tk.Button(master=root, text ="Stop", command = check_choice_off)#pause the plot
+stop_b.pack( side = Tk.LEFT)
+
+quit_b = Tk.Button(master=root, text ="Quit", command = _quit)#exit
+quit_b.pack( side = Tk.LEFT)
+
+def main_loop():
+    global press, control_flag
+    #print (control_flag)
+    if control_flag!=0:
+        if press=='M':
+            spatial.setOnSpatialDataHandler(SpatialData3D)
+        elif press=='L':
+            spatial.setOnSpatialDataHandler(SpatialDataLine)
+
+    threading.Timer(1,main_loop).start()
+
+try:
+    #logging example, uncomment to generate a log file
+    #spatial.enableLogging(PhidgetLogLevel.PHIDGET_LOG_VERBOSE, "phidgetlog.log")
+
+    spatial.setOnAttachHandler(SpatialAttached)
+    spatial.setOnDetachHandler(SpatialDetached)
+    spatial.setOnErrorhandler(SpatialError)
+        
+except PhidgetException as e:
+    print("Phidget Exception %i: %s" % (e.code, e.details))
+    print("Exiting....")
+    exit(1)
+
+
+root.after(0, main_loop)#Check main_loop function as frequently as possible
+Tk.mainloop()#Update GUI
